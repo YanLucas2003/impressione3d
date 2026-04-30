@@ -1881,7 +1881,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 
 
-const MP_PUBLIC_KEY = "APP_USR-a8f176d6-f83b-48a0-87b2-92c2dcfbc989";
+const MP_PUBLIC_KEY = "APP_USR-4edd8d0c-67c6-4e7b-8ec7-d4b79c631c93";
 let mp = null, cardForm = null;
 let checkoutCart = [], checkoutTotal = 0, checkoutOrderId = null;
 let pixPollTimer = null, pixCountdownTimer = null;
@@ -2073,7 +2073,7 @@ async function payPix() {
 
   try {
     const { orderId, total } = await createOrder({ name:nome, email, cpf }, 'pix');
-    const res = await fetch('/.netlify/functions/create-payment', {
+    const res = await fetch('/api/create-payment', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ method:'pix', orderId, total, payer:{ name:nome, email, cpf } })
@@ -2215,7 +2215,7 @@ async function handleCardToken(token) {
   showLoading();
   try {
     const { orderId, total } = await createOrder({ name:nome, email, cpf }, 'card');
-    const res = await fetch('/.netlify/functions/create-payment', {
+    const res = await fetch('/api/create-payment', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
