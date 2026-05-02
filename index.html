@@ -1386,10 +1386,17 @@ async function submitReview() {
 // COMPRA RÁPIDA
 // ═══════════════════════════════════════════════════
 function buyNow(id) {
+  // Adiciona ao carrinho e abre checkout com PIX selecionado
   const p = PRODUCTS.find(x => x.id === id); if (!p) return;
-  const s = getSession();
-  const msg = `Olá${s ? " (" + s.nome + ")" : ""}! Quero comprar via *PIX* com 10% de desconto.%0A%0AProduto: ${p.name}%0AValor no PIX: ${fmt(pixPrice(p.price))}%0A%0AComo prosseguir?`;
-  window.open("https://wa.me/" + WA + "?text=" + msg, "_blank");
+  const ex = cart.find(c => c.id === id);
+  if (!ex) { cart.push({...p, qty:1}); updateCart(); saveCart(); }
+  closeProduct();
+  // Pequeno delay para fechar o drawer antes de abrir o checkout
+  setTimeout(() => {
+    openCheckout();
+    // Selecionar PIX automaticamente após o checkout abrir
+    setTimeout(() => switchMethod('pix'), 200);
+  }, 150);
 }
 
 function addToCartById(id) {
