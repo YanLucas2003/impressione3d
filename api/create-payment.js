@@ -23,6 +23,7 @@ module.exports = async (req, res) => {
   try {
     const { method, payer, items, couponCode } = req.body || {};
     validatePaymentInput(method, payer, items);
+    validateFirebaseAdminReady();
 
     const user = await verifyRequestUser(req.headers || {});
     const db = getFirestore();
@@ -68,6 +69,12 @@ module.exports = async (req, res) => {
 
 function createRequestId() {
   return "chk_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function validateFirebaseAdminReady() {
+  if (!hasFirebaseAdminConfig()) {
+    throw publicError("Checkout indisponivel: Firebase Admin nao configurado no deploy.", 500);
+  }
 }
 
 function logBackendError(message, details) {

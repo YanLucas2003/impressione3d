@@ -26,6 +26,7 @@ exports.handler = async (event) => {
     const body = parseBody(event.body);
     const { method, payer, items, couponCode } = body;
     validatePaymentInput(method, payer, items);
+    validateFirebaseAdminReady();
 
     const user = await verifyRequestUser(event.headers || {});
     const db = getFirestore();
@@ -69,6 +70,12 @@ exports.handler = async (event) => {
 
 function createRequestId() {
   return "chk_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function validateFirebaseAdminReady() {
+  if (!hasFirebaseAdminConfig()) {
+    throw publicError("Checkout indisponivel: Firebase Admin nao configurado no deploy.", 500);
+  }
 }
 
 function logBackendError(message, details) {

@@ -15,6 +15,7 @@ exports.handler = async (event) => {
 
   try {
     const { items = [], couponCode = "", payer = {} } = parseBody(event.body);
+    validateFirebaseAdminReady();
     const user = await verifyRequestUser(event.headers || {});
     const db = getFirestore();
     const order = await createManualOrder(db, { items, couponCode, payer, uid: user.uid });
@@ -36,6 +37,12 @@ exports.handler = async (event) => {
 
 function createRequestId() {
   return "ord_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function validateFirebaseAdminReady() {
+  if (!hasFirebaseAdminConfig()) {
+    throw publicError("Checkout indisponivel: Firebase Admin nao configurado no deploy.", 500);
+  }
 }
 
 function json(headers, statusCode, body) {
