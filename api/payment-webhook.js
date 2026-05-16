@@ -1,101 +1,118 @@
 const https = require("https");
+const { fieldValue, getFirestore } = require("../lib/firebase-admin");
 
-const MP_ACCESS_TOKEN  = process.env.MP_ACCESS_TOKEN;
-const FIREBASE_PROJECT = process.env.FIREBASE_PROJECT_ID || "impressione3d-4cd76";
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 
 const STATUS_MAP = { approved: 1, in_process: 1, pending: 0, rejected: -1, cancelled: -1, refunded: -1 };
 
 module.exports = async (req, res) => {
   if (req.method === "GET") { res.status(200).send("OK"); return; }
+  if (!MP_ACCESS_TOKEN) { res.status(500).json({ error: "Pagamento nao configurado." }); return; }
 
   try {
-    const body   = req.body || {};
-    const topic  = body.type || req.query?.topic;
+    const body = req.body || {};
+    const topic = body.type || req.query?.topic;
     const dataId = body.data?.id || req.query?.id;
 
     if (!dataId || topic !== "payment") {
-      res.status(200).json({ msg: "ignored" }); return;
+      res.status(200).json({ msg: "ignored" });
+      return;
     }
 
-    const payment  = await callMP("GET", "/v1/payments/" + dataId);
-    const orderId  = payment.external_reference;
+    const payment = await callMP("GET", "/v1/payments/" + dataId);
+    const orderId = payment.external_reference;
     const mpStatus = payment.status;
-    const newIdx   = STATUS_MAP[mpStatus] ?? 0;
+    const newIdx = STATUS_MAP[mpStatus] ?? 0;
 
     if (!orderId) { res.status(200).json({ msg: "no orderId" }); return; }
 
     if (newIdx >= 0) {
       await updateOrderInFirestore(orderId, newIdx, {
-        mpPaymentId:    String(dataId),
+        mpPaymentId: String(dataId),
         mpStatus,
         mpStatusDetail: payment.status_detail || "",
-        paidAt:         mpStatus === "approved" ? new Date().toISOString() : null,
-        updatedAt:      new Date().toISOString(),
+        approved: mpStatus === "approved",
       });
     }
 
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("webhook error:", err.message);
-    res.status(200).json({ error: err.message });
+    res.status(500).json({ error: "Webhook temporariamente indisponivel." });
   }
 };
 
 async function updateOrderInFirestore(orderId, statusIdx, extra) {
-  const base = "https://firestore.googleapis.com/v1/projects/" + FIREBASE_PROJECT + "/databases/(default)/documents";
+  const db = getFirestore();
+  const snap = await db.collection("orders").where("num", "==", String(orderId)).limit(1).get();
 
-  const queryBody = JSON.stringify({
-    structuredQuery: {
-      from: [{ collectionId: "orders" }],
-      where: { fieldFilter: { field: { fieldPath: "num" }, op: "EQUAL", value: { stringValue: orderId } } },
-      limit: 1,
-    },
-  });
+  if (snap.empty) {
+    console.warn("Pedido nao encontrado:", orderId);
+    return;
+  }
 
-  const queryResult = await callFirestore("POST", base + ":runQuery", queryBody);
-  const results = Array.isArray(queryResult) ? queryResult : [queryResult];
-  const docPath = results[0]?.document?.name;
-
-  if (!docPath) { console.warn("Pedido nao encontrado:", orderId); return; }
-
+  const doc = snap.docs[0];
+  const order = doc.data();
   const fields = {
-    statusIdx:      { integerValue: String(statusIdx) },
-    mpPaymentId:    { stringValue: extra.mpPaymentId || "" },
-    mpStatus:       { stringValue: extra.mpStatus || "" },
-    mpStatusDetail: { stringValue: extra.mpStatusDetail || "" },
-    updatedAt:      { stringValue: extra.updatedAt },
+    statusIdx,
+    mpPaymentId: extra.mpPaymentId || "",
+    mpStatus: extra.mpStatus || "",
+    mpStatusDetail: extra.mpStatusDetail || "",
+    updatedAt: fieldValue.serverTimestamp(),
   };
-  if (extra.paidAt) fields.paidAt = { stringValue: extra.paidAt };
+  if (extra.approved) fields.paidAt = fieldValue.serverTimestamp();
 
-  const mask = Object.keys(fields).map(f => "updateMask.fieldPaths=" + f).join("&");
-  await callFirestore("PATCH", "https://firestore.googleapis.com/v1/" + docPath + "?" + mask, JSON.stringify({ fields }));
+  await doc.ref.set(fields, { merge: true });
+  if (extra.approved) await markCouponUsed(db, order, orderId);
+}
+
+async function markCouponUsed(db, order, orderId) {
+  const code = String(order.couponCode || "").trim().toUpperCase();
+  if (!code || !order.userId) return;
+
+  const userRef = db.collection("users").doc(order.userId);
+  await db.runTransaction(async (tx) => {
+    const userSnap = await tx.get(userRef);
+    if (!userSnap.exists) return;
+
+    const coupons = userSnap.data().coupons || [];
+    let changed = false;
+    const nextCoupons = coupons.map((coupon) => {
+      if (String(coupon.code || "").toUpperCase() !== code || coupon.used) return coupon;
+      changed = true;
+      return {
+        ...coupon,
+        orderId,
+        used: true,
+        usedAt: new Date().toISOString(),
+      };
+    });
+
+    if (changed) tx.update(userRef, { coupons: nextCoupons });
+  });
 }
 
 function callMP(method, path) {
   return new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: "api.mercadopago.com", path, method,
+      hostname: "api.mercadopago.com",
+      path,
+      method,
       headers: { "Authorization": "Bearer " + MP_ACCESS_TOKEN, "Content-Type": "application/json" },
-    }, (res) => {
-      let d = ""; res.on("data", c => d += c);
-      res.on("end", () => { try { resolve(JSON.parse(d)); } catch { reject(new Error("MP parse error")); } });
-    });
-    req.on("error", reject); req.end();
-  });
-}
-
-function callFirestore(method, url, body) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const req = https.request({
-      hostname: parsed.hostname, path: parsed.pathname + parsed.search, method,
-      headers: { "Content-Type": "application/json" },
-    }, (res) => {
-      let d = ""; res.on("data", c => d += c);
-      res.on("end", () => { try { resolve(JSON.parse(d)); } catch { resolve({}); } });
+    }, (response) => {
+      let data = "";
+      response.on("data", (chunk) => data += chunk);
+      response.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (response.statusCode >= 400) reject(new Error(parsed.message || JSON.stringify(parsed)));
+          else resolve(parsed);
+        } catch {
+          reject(new Error("MP parse error"));
+        }
+      });
     });
     req.on("error", reject);
-    if (body) req.write(body);
     req.end();
   });
 }

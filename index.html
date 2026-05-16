@@ -760,10 +760,6 @@ const FIREBASE_CONFIG = {
   appId:             "1:596339455487:web:8fb42a631181c7307da3ca"
 };
 
-// Admin fixo — não altere
-const ADMIN_EMAIL = "admin@impressione3d.com";
-const ADMIN_PASS  = "@Yanlucas4k";
-const ADMIN_TEL   = "31995169519";
 const WA          = "5531995169519";
 
 const STATUS_LABELS = ["Aguardando confirmação","Confirmado","Em produção","Em trânsito para entrega","Entregue"];
@@ -803,30 +799,10 @@ async function initFirebase() {
       }
     });
 
-    // Criar admin padrão se não existir
-    await ensureAdminExists();
     console.log("Firebase OK");
   } catch (e) {
     console.warn("Firebase não inicializado — modo offline:", e.message);
     fbReady = false;
-  }
-}
-
-async function ensureAdminExists() {
-  try {
-    // Tenta logar como admin para verificar se existe
-    const snap = await db.collection("users").where("tipo","==","admin").limit(1).get();
-    if (snap.empty) {
-      // Cria o admin
-      const cred = await auth.createUserWithEmailAndPassword(ADMIN_EMAIL, ADMIN_PASS);
-      await db.collection("users").doc(cred.user.uid).set({
-        nome: "Yan Admin", email: ADMIN_EMAIL, telefone: ADMIN_TEL,
-        tipo: "admin", pontos: 0, coupons: [], createdAt: firebase.firestore.FieldValue.serverTimestamp()
-      });
-      await auth.signOut(); // sai do admin depois de criar
-    }
-  } catch(e) {
-    // Admin já existe ou erro tolerável
   }
 }
 
@@ -2032,39 +2008,48 @@ function maskCPF(el) {
 }
 
 // ── CRIAR PEDIDO NO FIREBASE ─────────────────────────
+async function getPaymentHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  const token = auth?.currentUser ? await auth.currentUser.getIdToken() : null;
+  if (!token) throw new Error('Sessao expirada. Entre novamente.');
+  if (token) headers.Authorization = 'Bearer ' + token;
+  return headers;
+}
+
 async function createOrder(payerData, method) {
   const s      = getSession();
-  const numPed = gerarNumeroPedido();
-  const total  = method === 'pix' ? parseFloat((checkoutTotal * 0.9).toFixed(2)) : checkoutTotal;
-  const itens  = checkoutCart.map(c => c.name + ' x' + c.qty);
+  if (!s) throw new Error('Sessao expirada. Entre novamente.');
+  if (!fbReady || !db) throw new Error('Firebase indisponivel. Tente novamente.');
 
-  if (fbReady) {
-    try {
-      const ref = await db.collection('orders').add({
-        num: numPed,
-        data: new Date().toLocaleDateString('pt-BR'),
-        itens, total,
-        statusIdx: 0,
-        userId:    s.uid,
-        userName:  s.nome,
-        userEmail: s.email || '',
-        userTel:   s.telefone || '',
-        paymentMethod: method,
-        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-      });
-      checkoutOrderId = numPed;
-      // Atualizar vendas dos produtos
-      for (const c of checkoutCart) {
-        db.collection('productStats').doc(c.id).set(
-          { sales: firebase.firestore.FieldValue.increment(c.qty) },
-          { merge: true }
-        );
-      }
-      return { orderId: numPed, total, docId: ref.id };
-    } catch(e) { console.warn('createOrder Firestore error:', e); }
+  const numPed = gerarNumeroPedido();
+  const subtotal = checkoutCart.reduce((a, c) => a + c.price * c.qty, 0);
+  const discountPct = activeCupom ? Number(activeCupom.pct) || 0 : 0;
+  const baseTotal = parseFloat((subtotal - (subtotal * discountPct / 100)).toFixed(2));
+  const total  = method === 'pix' ? parseFloat((baseTotal * 0.9).toFixed(2)) : baseTotal;
+  const itens  = checkoutCart.map(c => c.name + ' x' + c.qty);
+  const cartItems = checkoutCart.map(c => ({ id: String(c.id), qty: Number(c.qty) || 1 }));
+
+  try {
+    const ref = await db.collection('orders').add({
+      num: numPed,
+      data: new Date().toLocaleDateString('pt-BR'),
+      itens, cartItems, subtotal: parseFloat(subtotal.toFixed(2)), total,
+      discountPct,
+      couponCode: activeCupom?.code || '',
+      statusIdx: 0,
+      userId:    s.uid,
+      userName:  s.nome,
+      userEmail: s.email || '',
+      userTel:   s.telefone || '',
+      paymentMethod: method,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+    checkoutOrderId = numPed;
+    return { orderId: numPed, total, docId: ref.id };
+  } catch(e) {
+    console.warn('createOrder Firestore error:', e);
+    throw new Error('Nao foi possivel salvar o pedido. Tente novamente.');
   }
-  checkoutOrderId = numPed;
-  return { orderId: numPed, total };
 }
 
 // ── PIX ─────────────────────────────────────────────
@@ -2079,11 +2064,12 @@ async function payPix() {
   showLoading();
 
   try {
-    const { orderId, total } = await createOrder({ name:nome, email, cpf }, 'pix');
+    const headers = await getPaymentHeaders();
+    const { orderId } = await createOrder({ name:nome, email, cpf }, 'pix');
     const res = await fetch('/api/create-payment', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ method:'pix', orderId, total, payer:{ name:nome, email, cpf } })
+      headers,
+      body: JSON.stringify({ method:'pix', orderId, payer:{ name:nome, email, cpf } })
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Erro ao gerar PIX');
@@ -2221,12 +2207,13 @@ async function handleCardToken(token) {
   const errEl = document.getElementById('cardErr');
   showLoading();
   try {
-    const { orderId, total } = await createOrder({ name:nome, email, cpf }, 'card');
+    const headers = await getPaymentHeaders();
+    const { orderId } = await createOrder({ name:nome, email, cpf }, 'card');
     const res = await fetch('/api/create-payment', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
-        method: 'card', orderId, total,
+        method: 'card', orderId,
         payer: {
           name: nome, email, cpf,
           token: token.id,
