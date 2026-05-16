@@ -6,8 +6,13 @@ const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const STATUS_MAP = { approved: 1, in_process: 1, pending: 0, rejected: -1, cancelled: -1, refunded: -1 };
 
 module.exports = async (req, res) => {
+  const requestId = createRequestId();
   if (req.method === "GET") { res.status(200).send("OK"); return; }
-  if (!MP_ACCESS_TOKEN) { res.status(500).json({ error: "Pagamento nao configurado." }); return; }
+  if (!MP_ACCESS_TOKEN) {
+    console.error("webhook missing env", JSON.stringify({ requestId, missing: "MP_ACCESS_TOKEN" }));
+    res.status(500).json({ error: "Pagamento nao configurado.", requestId });
+    return;
+  }
 
   try {
     const body = req.body || {};
@@ -33,14 +38,19 @@ module.exports = async (req, res) => {
         mpStatusDetail: payment.status_detail || "",
         approved: mpStatus === "approved",
       });
+      console.log("webhook order updated", JSON.stringify({ requestId, orderId, dataId: String(dataId), mpStatus, statusIdx: newIdx }));
     }
 
     res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("webhook error:", err.message);
-    res.status(500).json({ error: "Webhook temporariamente indisponivel." });
+    console.error("webhook error", JSON.stringify({ requestId, error: err.message, stack: err.stack }));
+    res.status(500).json({ error: "Webhook temporariamente indisponivel.", requestId });
   }
 };
+
+function createRequestId() {
+  return "wh_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
 
 async function updateOrderInFirestore(orderId, statusIdx, extra) {
   const db = getFirestore();

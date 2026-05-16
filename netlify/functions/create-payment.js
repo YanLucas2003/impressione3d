@@ -1,11 +1,12 @@
 const https = require("https");
-const { fieldValue, getAuth, getFirestore } = require("../../lib/firebase-admin");
+const { fieldValue, getAuth, getFirestore, hasFirebaseAdminConfig } = require("../../lib/firebase-admin");
 const { calculateOrderTotal } = require("../../lib/product-catalog");
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const SITE_URL = process.env.URL || "https://impressione3d.netlify.app";
 
 exports.handler = async (event) => {
+  const requestId = createRequestId();
   const headers = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -16,19 +17,22 @@ exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return { statusCode: 200, headers, body: "" };
   if (event.httpMethod !== "POST") return json(headers, 405, { error: "Method not allowed" });
 
-  if (!MP_ACCESS_TOKEN) return json(headers, 500, { error: "Pagamento nao configurado." });
+  if (!MP_ACCESS_TOKEN) {
+    logBackendError("create-payment missing env", { requestId, missing: "MP_ACCESS_TOKEN" });
+    return json(headers, 500, { error: "Pagamento nao configurado. MP_ACCESS_TOKEN ausente.", requestId });
+  }
 
   try {
     const body = parseBody(event.body);
-    const { method, payer, orderId } = body;
-    validatePaymentInput(method, payer, orderId);
+    const { method, payer, items, couponCode } = body;
+    validatePaymentInput(method, payer, items);
 
     const user = await verifyRequestUser(event.headers || {});
     const db = getFirestore();
-    const order = await loadAndPriceOrder(db, orderId, method, user.uid);
+    const order = await createOrder(db, { method, payer, items, couponCode, uid: user.uid });
     const notificationUrl = SITE_URL + "/.netlify/functions/payment-webhook";
 
-    const payment = await createPayment(method, payer, orderId, order.amount, notificationUrl);
+    const payment = await createPayment(method, payer, order.orderId, order.amount, notificationUrl);
     await persistPayment(order.ref, payment, method, order);
 
     if (method === "pix") {
@@ -38,7 +42,7 @@ exports.handler = async (event) => {
         qr_code: payment.point_of_interaction?.transaction_data?.qr_code,
         qr_code_b64: payment.point_of_interaction?.transaction_data?.qr_code_base64,
         ticket_url: payment.point_of_interaction?.transaction_data?.ticket_url,
-        orderId,
+        orderId: order.orderId,
       });
     }
 
@@ -46,13 +50,30 @@ exports.handler = async (event) => {
       id: payment.id,
       status: payment.status,
       status_detail: payment.status_detail,
-      orderId,
+      orderId: order.orderId,
     });
   } catch (err) {
-    console.error("create-payment error:", err.message);
-    return json(headers, err.statusCode || 500, { error: err.publicMessage || "Nao foi possivel criar o pagamento." });
+    logBackendError("create-payment error", {
+      requestId,
+      hasAuthorization: Boolean((event.headers || {}).authorization || (event.headers || {}).Authorization),
+      hasFirebaseAdminConfig: hasFirebaseAdminConfig(),
+      error: err.message,
+      stack: err.stack,
+    });
+    return json(headers, err.statusCode || 500, {
+      error: err.publicMessage || "Nao foi possivel criar o pagamento. Tente novamente em instantes.",
+      requestId,
+    });
   }
 };
+
+function createRequestId() {
+  return "chk_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
+
+function logBackendError(message, details) {
+  console.error(message, JSON.stringify(details));
+}
 
 function json(headers, statusCode, body) {
   return { statusCode, headers, body: JSON.stringify(body) };
@@ -73,10 +94,10 @@ function parseBody(raw) {
   }
 }
 
-function validatePaymentInput(method, payer, orderId) {
+function validatePaymentInput(method, payer, items) {
   if (!["pix", "card"].includes(method)) throw publicError("Metodo invalido.");
-  if (!orderId) throw publicError("Pedido invalido.");
   if (!payer?.email) throw publicError("E-mail do pagador obrigatorio.");
+  if (!Array.isArray(items) || !items.length) throw publicError("Carrinho invalido.");
   if (method === "card" && (!payer.token || !payer.payment_method_id)) {
     throw publicError("Dados do cartao invalidos.");
   }
@@ -94,33 +115,55 @@ async function verifyRequestUser(headers) {
   }
 }
 
-async function loadAndPriceOrder(db, orderId, method, uid) {
-  const snap = await db.collection("orders").where("num", "==", String(orderId)).limit(1).get();
-  if (snap.empty) throw publicError("Pedido nao encontrado.", 404);
-
-  const doc = snap.docs[0];
-  const data = doc.data();
-  if (data.userId !== uid) throw publicError("Pedido nao pertence ao usuario.", 403);
-  if (data.paymentMethod && data.paymentMethod !== method) throw publicError("Metodo de pagamento divergente.");
-
-  const discountPct = await resolveDiscountPct(db, data, uid);
+async function createOrder(db, { method, payer, items, couponCode, uid }) {
+  const discountPct = await resolveDiscountPct(db, couponCode, uid);
   let priced;
   try {
-    priced = calculateOrderTotal(data.cartItems, { method, discountPct });
+    priced = calculateOrderTotal(items, { method, discountPct });
   } catch (err) {
     throw publicError(err.message);
   }
 
+  const orderId = generateOrderId();
+  const cartItems = items.map((item) => ({
+    id: String(item.id),
+    name: String(item.name || item.id || ""),
+    qty: Number(item.qty) || 1,
+  }));
+  const itens = cartItems.map((item) => item.name + " x" + item.qty);
+  const userSnap = await db.collection("users").doc(uid).get();
+  const user = userSnap.exists ? userSnap.data() : {};
+  const ref = db.collection("orders").doc();
+
+  await ref.set({
+    num: orderId,
+    data: new Date().toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" }),
+    itens,
+    cartItems,
+    subtotal: priced.subtotal,
+    total: priced.total,
+    discountPct: priced.discountPct,
+    couponCode: String(couponCode || "").trim().toUpperCase(),
+    statusIdx: 0,
+    userId: uid,
+    userName: user.nome || payer.name || "",
+    userEmail: user.email || payer.email || "",
+    userTel: user.telefone || "",
+    paymentMethod: method,
+    createdAt: fieldValue.serverTimestamp(),
+  });
+
   return {
+    orderId,
     amount: priced.total,
     discountPct: priced.discountPct,
-    ref: doc.ref,
+    ref,
     subtotal: priced.subtotal,
   };
 }
 
-async function resolveDiscountPct(db, order, uid) {
-  const code = String(order.couponCode || "").trim().toUpperCase();
+async function resolveDiscountPct(db, couponCode, uid) {
+  const code = String(couponCode || "").trim().toUpperCase();
   if (!code) return 0;
 
   const userSnap = await db.collection("users").doc(uid).get();
@@ -128,6 +171,10 @@ async function resolveDiscountPct(db, order, uid) {
   const coupon = coupons.find((item) => String(item.code || "").toUpperCase() === code && !item.used);
   if (!coupon) throw publicError("Cupom invalido ou ja utilizado.");
   return Number(coupon.pct) || 0;
+}
+
+function generateOrderId() {
+  return "PED" + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
 }
 
 async function persistPayment(orderRef, payment, method, order) {
@@ -203,7 +250,10 @@ function callMP(method, path, body, orderId, paymentMethod) {
         try {
           const parsed = JSON.parse(data);
           if (res.statusCode >= 400) {
-            reject(new Error(parsed.message || parsed.cause?.[0]?.description || JSON.stringify(parsed)));
+            const message = parsed.message || parsed.cause?.[0]?.description || JSON.stringify(parsed);
+            const err = new Error("Mercado Pago " + res.statusCode + ": " + message);
+            err.mpStatusCode = res.statusCode;
+            reject(err);
           } else {
             resolve(parsed);
           }

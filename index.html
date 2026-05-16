@@ -1663,26 +1663,30 @@ function gerarNumeroPedido() {
 
 async function enviarComprovante() {
   const s = getSession(); if (!s) { openAuth("login"); return; }
-  const numPed = gerarNumeroPedido();
-  const total  = cart.reduce((a, c) => a + c.price * c.qty, 0);
+  const cartItems = cart.map(c => ({ id: String(c.id), name: c.name, qty: Number(c.qty) || 1 }));
+  let numPed = "";
+  let total  = cart.reduce((a, c) => a + c.price * c.qty, 0);
   const itens  = cart.length ? cart.map(c => c.name + " x" + c.qty) : ["(pedido de serviço)"];
 
   showLoading();
-  // Salvar pedido no Firestore
-  if (fbReady) {
-    try {
-      await db.collection("orders").add({
-        num: numPed, data: new Date().toLocaleDateString("pt-BR"),
-        itens, total, statusIdx: 0,
-        userId: s.uid, userName: s.nome, userEmail: s.email || "", userTel: s.telefone || "",
-        createdAt: firebase.firestore.FieldValue.serverTimestamp()
-      });
-      // Atualizar stats de vendas dos produtos
-      for (const c of cart) {
-        const sRef = db.collection("productStats").doc(c.id);
-        await sRef.set({ sales: firebase.firestore.FieldValue.increment(c.qty) }, { merge: true });
-      }
-    } catch (e) { console.warn("Firestore order error:", e); }
+  try {
+    const headers = await getPaymentHeaders();
+    const res = await fetch('/api/create-order', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        items: cartItems,
+        couponCode: activeCupom?.code || '',
+        payer: { name: s.nome, email: s.email || '' },
+      })
+    });
+    const data = await readApiJson(res, 'Nao foi possivel criar o pedido.');
+    numPed = data.orderId;
+    total = Number(data.total) || total;
+  } catch (e) {
+    hideLoading();
+    showToast("âŒ " + e.message);
+    return;
   }
 
   // Adicionar ponto
@@ -1696,13 +1700,7 @@ async function enviarComprovante() {
   if (newCoupon) showToast("🎉 10 pontos! Cupom " + newCoupon.code + " (" + newCoupon.pct + "% OFF) gerado!");
   else showToast("✅ Pedido " + numPed + " gerado! +1 ponto ⭐");
 
-  // Marcar cupom como usado se havia um aplicado
-  if (activeCupom && fbReady) {
-    try {
-      const snap = await db.collection("users").doc(s.uid).get();
-      const coupons = (snap.data()?.coupons || []).map(c => c.code === activeCupom.code ? { ...c, used: true } : c);
-      await db.collection("users").doc(s.uid).update({ coupons });
-    } catch {}
+  if (activeCupom) {
     activeCupom = null;
     document.getElementById("cupomInput").value = "";
     document.getElementById("cupomOk").textContent = "";
@@ -2016,40 +2014,39 @@ async function getPaymentHeaders() {
   return headers;
 }
 
-async function createOrder(payerData, method) {
+function buildPaymentPayload(payerData, method, cardData = {}) {
   const s      = getSession();
   if (!s) throw new Error('Sessao expirada. Entre novamente.');
   if (!fbReady || !db) throw new Error('Firebase indisponivel. Tente novamente.');
 
-  const numPed = gerarNumeroPedido();
-  const subtotal = checkoutCart.reduce((a, c) => a + c.price * c.qty, 0);
-  const discountPct = activeCupom ? Number(activeCupom.pct) || 0 : 0;
-  const baseTotal = parseFloat((subtotal - (subtotal * discountPct / 100)).toFixed(2));
-  const total  = method === 'pix' ? parseFloat((baseTotal * 0.9).toFixed(2)) : baseTotal;
-  const itens  = checkoutCart.map(c => c.name + ' x' + c.qty);
-  const cartItems = checkoutCart.map(c => ({ id: String(c.id), qty: Number(c.qty) || 1 }));
+  const cartItems = checkoutCart.map(c => ({ id: String(c.id), name: c.name, qty: Number(c.qty) || 1 }));
+  if (!cartItems.length) throw new Error('Carrinho invalido.');
 
+  return {
+    method,
+    items: cartItems,
+    couponCode: activeCupom?.code || '',
+    payer: {
+      name: payerData.name,
+      email: payerData.email,
+      cpf: payerData.cpf,
+      ...cardData,
+    },
+  };
+}
+
+async function readApiJson(res, fallbackMessage) {
+  let data = {};
   try {
-    const ref = await db.collection('orders').add({
-      num: numPed,
-      data: new Date().toLocaleDateString('pt-BR'),
-      itens, cartItems, subtotal: parseFloat(subtotal.toFixed(2)), total,
-      discountPct,
-      couponCode: activeCupom?.code || '',
-      statusIdx: 0,
-      userId:    s.uid,
-      userName:  s.nome,
-      userEmail: s.email || '',
-      userTel:   s.telefone || '',
-      paymentMethod: method,
-      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-    });
-    checkoutOrderId = numPed;
-    return { orderId: numPed, total, docId: ref.id };
-  } catch(e) {
-    console.warn('createOrder Firestore error:', e);
-    throw new Error('Nao foi possivel salvar o pedido. Tente novamente.');
+    data = await res.json();
+  } catch {
+    data = {};
   }
+  if (!res.ok) {
+    const requestId = data.requestId ? ` (codigo ${data.requestId})` : '';
+    throw new Error((data.error || fallbackMessage) + requestId);
+  }
+  return data;
 }
 
 // ── PIX ─────────────────────────────────────────────
@@ -2065,17 +2062,17 @@ async function payPix() {
 
   try {
     const headers = await getPaymentHeaders();
-    const { orderId } = await createOrder({ name:nome, email, cpf }, 'pix');
+    const payload = buildPaymentPayload({ name:nome, email, cpf }, 'pix');
     const res = await fetch('/api/create-payment', {
       method: 'POST',
       headers,
-      body: JSON.stringify({ method:'pix', orderId, payer:{ name:nome, email, cpf } })
+      body: JSON.stringify(payload)
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Erro ao gerar PIX');
+    const data = await readApiJson(res, 'Erro ao gerar PIX. Tente novamente.');
+    checkoutOrderId = data.orderId;
     hideLoading();
     showPixQR(data);
-    startPixPoll(data.id, orderId);
+    startPixPoll(data.id, data.orderId);
     startPixCountdown(900); // 15 min
     btn.style.display = 'none';
   } catch(e) {
@@ -2208,26 +2205,22 @@ async function handleCardToken(token) {
   showLoading();
   try {
     const headers = await getPaymentHeaders();
-    const { orderId } = await createOrder({ name:nome, email, cpf }, 'card');
+    const payload = buildPaymentPayload({ name:nome, email, cpf }, 'card', {
+      token: token.id,
+      installments: inst,
+      payment_method_id: token.payment_method_id,
+      issuer_id: token.issuer_id,
+    });
     const res = await fetch('/api/create-payment', {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        method: 'card', orderId,
-        payer: {
-          name: nome, email, cpf,
-          token: token.id,
-          installments: inst,
-          payment_method_id: token.payment_method_id,
-          issuer_id: token.issuer_id,
-        }
-      })
+      body: JSON.stringify(payload)
     });
-    const data = await res.json();
+    const data = await readApiJson(res, 'Erro no pagamento. Tente novamente.');
+    checkoutOrderId = data.orderId;
     hideLoading();
-    if (!res.ok) throw new Error(data.error || 'Erro no pagamento');
     if (data.status === 'approved') {
-      onPaymentApproved(orderId);
+      onPaymentApproved(data.orderId);
     } else if (data.status === 'in_process') {
       showToast('⏳ Pagamento em análise. Aguarde confirmação.');
       cart = []; updateCart(); saveCart();

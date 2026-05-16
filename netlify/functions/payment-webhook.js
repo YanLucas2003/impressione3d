@@ -6,10 +6,14 @@ const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const STATUS_MAP = { approved: 1, in_process: 1, pending: 0, rejected: -1, cancelled: -1, refunded: -1 };
 
 exports.handler = async (event) => {
+  const requestId = createRequestId();
   const headers = { "Content-Type": "application/json" };
 
   if (event.httpMethod === "GET") return { statusCode: 200, headers, body: "OK" };
-  if (!MP_ACCESS_TOKEN) return json(headers, 500, { error: "Pagamento nao configurado." });
+  if (!MP_ACCESS_TOKEN) {
+    console.error("webhook missing env", JSON.stringify({ requestId, missing: "MP_ACCESS_TOKEN" }));
+    return json(headers, 500, { error: "Pagamento nao configurado.", requestId });
+  }
 
   try {
     const body = JSON.parse(event.body || "{}");
@@ -34,14 +38,19 @@ exports.handler = async (event) => {
         mpStatusDetail: payment.status_detail || "",
         approved: mpStatus === "approved",
       });
+      console.log("webhook order updated", JSON.stringify({ requestId, orderId, dataId: String(dataId), mpStatus, statusIdx: newIdx }));
     }
 
     return json(headers, 200, { ok: true });
   } catch (err) {
-    console.error("webhook error:", err.message);
-    return json(headers, 500, { error: "Webhook temporariamente indisponivel." });
+    console.error("webhook error", JSON.stringify({ requestId, error: err.message, stack: err.stack }));
+    return json(headers, 500, { error: "Webhook temporariamente indisponivel.", requestId });
   }
 };
+
+function createRequestId() {
+  return "wh_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+}
 
 function json(headers, statusCode, body) {
   return { statusCode, headers, body: JSON.stringify(body) };
